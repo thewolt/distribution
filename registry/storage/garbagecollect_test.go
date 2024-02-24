@@ -7,6 +7,7 @@ import (
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/manifest/ocischema"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
@@ -117,6 +118,29 @@ func uploadRandomSchema2Image(t *testing.T, repository distribution.Repository) 
 	}
 
 	manifest, err := testutil.MakeSchema2Manifest(repository, digests)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	manifestDigest := uploadImage(t, repository, image{manifest: manifest, layers: randomLayers})
+	return image{
+		manifest:       manifest,
+		manifestDigest: manifestDigest,
+		layers:         randomLayers,
+	}
+}
+
+func uploadRandomOCIImage(t *testing.T, repository distribution.Repository) image {
+	randomLayers, err := testutil.CreateRandomLayers(2)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	digests := []digest.Digest{}
+	for digest := range randomLayers {
+		digests = append(digests, digest)
+	}
+	manifest, err := testutil.MakeOCIManifest(repository, digests)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -267,6 +291,116 @@ func TestDeleteManifestIfTagNotFound(t *testing.T) {
 	}
 	if len(before2) == len(after2) {
 		t.Fatalf("Garbage collection affected manifest storage: %d == %d", len(before2), len(after2))
+	}
+}
+
+func TestDeleteManifestIndexWithDanglingReferences(t *testing.T) {
+	ctx := dcontext.Background()
+	inmemoryDriver := inmemory.New()
+
+	registry := createRegistry(t, inmemoryDriver)
+	repo := makeRepository(t, registry, "deletemanifests")
+	manifestService, _ := repo.Manifests(ctx)
+
+	image1 := uploadRandomOCIImage(t, repo)
+	image2 := uploadRandomOCIImage(t, repo)
+
+	ii, _ := ocischema.FromDescriptors([]distribution.Descriptor{
+		{Digest: image1.manifestDigest}, {Digest: image2.manifestDigest},
+	}, map[string]string{})
+
+	id, err := manifestService.Put(ctx, ii)
+	if err != nil {
+		t.Fatalf("manifest upload failed: %v", err)
+	}
+
+	repo.Tags(ctx).Tag(ctx, "test", distribution.Descriptor{Digest: id})
+
+	// delete image2 => ii has a dangling reference
+	manifestService.Delete(ctx, image2.manifestDigest)
+
+	before1 := allBlobs(t, registry)
+	before2 := allManifests(t, manifestService)
+
+	// run GC (should not remove anything because of tag)
+	err = MarkAndSweep(dcontext.Background(), inmemoryDriver, registry, GCOpts{
+		DryRun:         false,
+		RemoveUntagged: true,
+	})
+	if err != nil {
+		t.Fatalf("Failed mark and sweep: %v", err)
+	}
+
+	after1 := allBlobs(t, registry)
+	after2 := allManifests(t, manifestService)
+	if len(before1) == len(after1) {
+		t.Fatalf("Garbage collection did not affect blobs storage: %d == %d", len(before1), len(after1))
+	}
+	if len(before2) != len(after2) {
+		t.Fatalf("Garbage collection affected manifest storage: %d != %d", len(before2), len(after2))
+	}
+}
+
+func TestDeleteManifestIndexIfTagNotFound(t *testing.T) {
+	ctx := dcontext.Background()
+	inmemoryDriver := inmemory.New()
+
+	registry := createRegistry(t, inmemoryDriver)
+	repo := makeRepository(t, registry, "deletemanifests")
+	manifestService, _ := repo.Manifests(ctx)
+
+	image1 := uploadRandomOCIImage(t, repo)
+	image2 := uploadRandomOCIImage(t, repo)
+
+	ii, _ := ocischema.FromDescriptors([]distribution.Descriptor{
+		{Digest: image1.manifestDigest}, {Digest: image2.manifestDigest},
+	}, map[string]string{})
+
+	d4, err := manifestService.Put(ctx, ii)
+	if err != nil {
+		t.Fatalf("manifest upload failed: %v", err)
+	}
+
+	repo.Tags(ctx).Tag(ctx, "test", distribution.Descriptor{Digest: d4})
+
+	before1 := allBlobs(t, registry)
+	before2 := allManifests(t, manifestService)
+
+	// run GC (should not remove anything because of tag)
+	err = MarkAndSweep(dcontext.Background(), inmemoryDriver, registry, GCOpts{
+		DryRun:         false,
+		RemoveUntagged: true,
+	})
+	if err != nil {
+		t.Fatalf("Failed mark and sweep: %v", err)
+	}
+	beforeUntag1 := allBlobs(t, registry)
+	beforeUntag2 := allManifests(t, manifestService)
+	if len(before1) != len(beforeUntag1) {
+		t.Fatalf("Garbage collection affected blobs storage: %d != %d", len(before1), len(beforeUntag1))
+	}
+	if len(before2) != len(beforeUntag2) {
+		t.Fatalf("Garbage collection affected manifest storage: %d != %d", len(before2), len(beforeUntag2))
+	}
+
+	repo.Tags(ctx).Untag(ctx, "test")
+
+	// Run GC (removes everything because no manifests with tags exist)
+	err = MarkAndSweep(dcontext.Background(), inmemoryDriver, registry, GCOpts{
+		DryRun:         false,
+		RemoveUntagged: true,
+	})
+	if err != nil {
+		t.Fatalf("Failed mark and sweep: %v", err)
+	}
+
+	after1 := allBlobs(t, registry)
+	after2 := allManifests(t, manifestService)
+	if len(beforeUntag1) == len(after1) {
+		t.Fatalf("Garbage collection did not affect blobs storage: %d == %d", len(beforeUntag1), len(after1))
+	}
+	if len(beforeUntag2) == len(after2) {
+		t.Fatalf("Garbage collection did not affect manifest storage: %d == %d", len(beforeUntag2), len(after2))
 	}
 }
 
